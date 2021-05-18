@@ -1,10 +1,124 @@
 
+from copy import copy
 from io import BytesIO
 from math import ceil
 from pathlib import Path
 import warnings
 
+import numpy as np
+
 import _openjpeg
+
+
+class EncodingOptions:
+    """
+    """
+    def __init__(self):
+        """Create a new EncodingOptions instance.
+
+        Parameters
+        ----------
+        arr : numpy.ndarray, optional
+
+        """
+        self.subsampling = (1, 1)
+        self.progression_order = 0
+        self.block_size = (64, 64)
+        self.lossless = True
+        self.codec = 0  # J2K
+
+        # Input array parameters
+        self.width = None
+        self.height = None
+        self.nr_components = None
+        self.precision = None
+        self.is_signed = False
+
+    # NOTE: it might be easier to just pass the 0x0028 elements + UID
+    def from_pixel_data(self, arr, uid, bit_depth=Non):
+        """Setup the encoding options based on a `uid`
+
+        Parameters
+        ----------
+        arr : numpy.ndarray
+            The array containing the pixel data to be encoded.
+        uid : pydicom.uid.UID
+            The *Transfer Syntax UID* to use for encoding. Currently only
+            supports *JPEG 2000 Lossless*.
+        bit_depth : int, optional
+            If the array contains N-bit data (where N is not a multiple of 8),
+            then this should be N. For example, a uint16 numpy array may
+            only contain 12-bit data, in which case you should pass
+            ``bit_depth = 12``.
+        """
+        shape = arr.shape
+        if len(shape) > 3:
+            raise ValueError("The input array must be a single frame only")
+        elif len(shape) == 2:
+            self.nr_components = 1
+        else:
+            self.nr_components = shape[2]
+
+        self.height = shape[0]
+        self.width = shape[1]
+
+        if self.nr_components not in [1, 3]:
+            raise ValueError("The input array must have 1 or 3 channels only")
+
+        dtype = arr.dtype
+        if not np.issubdtype(dtype, np.integer):
+            raise ValueError("The input array must be made up of integers")
+
+        self.is_signed = np.issubdtype(dtype, np.signedinteger)
+        self.precision = dtype.itemsize * 8
+        if bit_depth:
+            self.precision = bit_depth
+
+        if uid == '1.2.840.10008.1.2.4.90':
+            self.subsampling = (1, 1)
+            self.progression_order = 0
+            self.block_size = (64, 64)
+            self.lossless = True
+            self.codec = 0
+
+            return
+
+        # TODO: Add support for lossy
+        # Hmm, how do we handle the quality?
+        if uid == '1.2.840.10008.1.2.4.91':
+            self.subsampling = (1, 1)
+            self.progression_order = 0
+            self.block_size = (64, 64)
+            self.lossless = False
+            self.codec = 0
+
+        raise NotImplementedError(
+            f"JPEG 2000 encoding for the Transfer Syntax UID '{uid}' is "
+            "not supported"
+        )
+
+    def to_dict(self):
+        opts = {}
+        # Encoding parameters
+        opts['dx'] = self.subsampling[0]
+        opts['dy'] = self.subsampling[1]
+        opts['prog_order'] = self.progression_order
+        opts['cblockw_init'] = self.block_size[0]
+        opts['cblockh_init'] = self.block_size[1]
+        opts['irreversible'] = int(not self.lossless)
+        opts['cod_format'] = self.codec
+
+        # Image parameters
+        opts['h'] = self.height
+        opts['w'] = self.width
+        opts['numcomps'] = self.nr_components
+        opts['prec'] = opts['bpp'] = self.precision
+        opts['sgnd'] = int(self.is_signed)
+
+        return opts
+
+    def validate(self):
+        pass
 
 
 def _get_format(stream):
@@ -214,6 +328,50 @@ def decode_pixel_data(stream, ds=None):
         )
 
     return arr
+
+
+def encode_pixel_data(arr, uid):
+    """Return JPEG encoded pixel data.
+
+    .. versionadded:: 1.2
+
+    **JPEG 2000 Lossless**
+
+    * Lossless encoding (reversible DWT 5-3)
+    * 1 tile
+    * If 3 channel RGB then YCC colourspace conversion will be applied prior
+      to encoding (? check this)
+    * No subsampling
+    * Precinct size 2**15 by 2**15
+    * Code-block size: 64 by 64
+    * No SOP or EPH markers in the codestream
+    * Progression order: LRCP
+    * No JP2 header
+
+    Parameters
+    ----------
+    arr : numpy.ndarray
+        The pixel data to be encoded, must be either 1 channel monochrome or
+        3 channel RGB.
+    uid : pydicom.uid.UID
+        The *Transfer Syntax UID* that the pixel data is to be encoded into.
+        Currently only *JPEG Lossless* is supported.
+
+    Returns
+    -------
+    bytes
+        The JPEG encoded pixel data.
+    """
+    if uid != '1.2.840.10008.1.2.4.90':
+        raise NotImplementedError(
+            "Only 'JPEG 2000 Lossless' is currently supported"
+        )
+
+    opts = EncodingOptions()
+    opts.from_pixel_data(arr, uid)
+    opts.validate()
+
+    return _openjpeg.encode(arr, opts.to_dict())
 
 
 def get_parameters(stream, j2k_format=None):
